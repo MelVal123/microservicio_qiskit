@@ -31,12 +31,10 @@ app = FastAPI(title="🌱 Quantum Agriculture API", version="1.0")
 # ----------------- CORS -----------------
 # 🚨 IMPORTANTE: incluimos el mismo dominio del backend y permitimos Swagger UI
 origins = [
-    "*",  # Para pruebas (puedes luego restringirlo)
     "http://localhost:5173",
     "http://localhost:3000",
     "https://zonas.grupo-digital-nextri.com",
-    "https://qiskit-production.up.railway.app",
-    "https://microservicioqiskit-production.up.railway.app",  # <--- Tu backend actual
+    "https://quantum.gruecolimp.com",
 ]
 
 app.add_middleware(
