@@ -32,8 +32,6 @@ COPY . .
 RUN pip install --upgrade pip
 RUN pip install -r requirements.txt
 
-# Railway usa por defecto la variable de entorno PORT, pero exponemos 8080 como fallback
 EXPOSE 8080
-
-# Comando para iniciar el microservicio FastAPI con Uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+# Comando para iniciar el microservicio FastAPI con Uvicorn (forma shell para expandir $PORT de Railway)
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}
