@@ -65,21 +65,31 @@ def conectar_bd():
         database=os.getenv("DB_NAME"),
         port=int(os.getenv("DB_PORT", 3306))
     )
-
 def obtener_ultimas_lecturas_de_zona(zone_id):
     conn = conectar_bd()
     cursor = conn.cursor(dictionary=True)
+    
+    # ✅ Traer lecturas de sensores
     query = """
-        SELECT s.tipo_sensor as sensor, l.valor, l.fecha_lectura
+        SELECT
+            i.codigo AS sensor,
+            l.valor,
+            l.timestamp_utc AS fecha_lectura
         FROM lecturas_sensor l
-        JOIN dispositivos_sensor ds ON l.id_dispositivo_sensor = ds.id_dispositivo_sensor
-        JOIN sensores s ON ds.id_sensor = s.id_sensor
-        JOIN dispositivos d ON ds.id_dispositivo = d.id_dispositivo
-        WHERE d.zona_agricola_id = %s
-        ORDER BY l.fecha_lectura DESC
+        JOIN nodos_sensor ns ON l.nodo_id = ns.id
+        JOIN terrenos t ON ns.terreno_id = t.id
+        JOIN indicadores i ON l.indicador_id = i.id
+        WHERE t.id = %s
+        ORDER BY l.timestamp_utc DESC
     """
     cursor.execute(query, (zone_id,))
     rows = cursor.fetchall()
+
+    # ✅ Traer altitud_msnm del terreno
+    cursor.execute("""
+        SELECT altitud_msnm FROM terrenos WHERE id = %s
+    """, (zone_id,))
+    terreno = cursor.fetchone()
     conn.close()
 
     if not rows:
@@ -91,18 +101,32 @@ def obtener_ultimas_lecturas_de_zona(zone_id):
         if key not in result:
             result[key] = {"valor": float(row["valor"]), "fecha_lectura": row["fecha_lectura"]}
 
-    ren = {"pH": "ph", "nitrogeno": "nitrógeno", "fosforo": "fósforo"}
-    return {ren.get(k, k): v for k, v in result.items()}
+    ren = {
+        "PH": "ph",
+        "NITROGENO": "nitrogeno",
+        "FOSFORO": "fosforo",
+        "POTASIO": "potasio",
+        "HUMEDAD": "humedad",
+        "TEMPERATURA": "temperatura",
+        "CONDUCTIVIDAD": "conductividad",
+        "MATERIA_ORGANICA": "materia_organica"
+    }
+    result = {ren.get(k, k): v for k, v in result.items()}
 
+    # ✅ Agregar altitud_msnm al resultado
+    if terreno and terreno["altitud_msnm"] is not None:
+        result["altitud_msnm"] = {"valor": float(terreno["altitud_msnm"]), "fecha_lectura": None}
+
+    return result
 def obtener_max_fecha_lectura(zone_id):
     conn = conectar_bd()
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT MAX(l.fecha_lectura)
+        SELECT MAX(l.timestamp_utc)
         FROM lecturas_sensor l
-        JOIN dispositivos_sensor ds ON l.id_dispositivo_sensor = ds.id_dispositivo_sensor
-        JOIN dispositivos d ON ds.id_dispositivo = d.id_dispositivo
-        WHERE d.zona_agricola_id = %s
+        JOIN nodos_sensor ns ON l.nodo_id = ns.id
+        JOIN terrenos t ON ns.terreno_id = t.id
+        WHERE t.id = %s
     """, (zone_id,))
     row = cursor.fetchone()
     conn.close()
@@ -122,7 +146,11 @@ def train(req: TrainRequest):
             "pca_png": base + os.path.basename(out["pca_file"]),
             "cluster_png": base + os.path.basename(out["cluster_file"]),
             "importance_png": base + os.path.basename(out["importance_file"]),
-            "bloch_png": base + (os.path.basename(out["bloch_file"]) if out.get("bloch_file") else None),
+            "bloch_png": (
+                base + os.path.basename(out["bloch_file"])
+                if out.get("bloch_file")
+                else None
+            ),
             "last_trained_at": out["last_trained_at"]
         }
         return {"status": "ok", "zone_id": req.zone_id, "files": files}
@@ -172,37 +200,45 @@ async def predict(raw_body: Dict[str, Any] = Body(...), zone_id: Optional[int] =
         scaler_path = os.path.join(zone_dir, f"scaler_qsvc_zone_{zone_id}.joblib")
 
         need_retrain = False
-        if not (os.path.exists(model_path) and os.path.exists(scaler_path)):
-            logging.info("No se encontró modelo para zona %s → entrenando por primera vez...", zone_id)
+
+        # ✅ Solo entrenar si NO existe modelo — nunca reentrenar automáticamente
+        pca_path = os.path.join(zone_dir, f"pca_quantum_zone_{zone_id}.joblib")
+        encoder_path = os.path.join(zone_dir, f"label_encoder_zone_{zone_id}.joblib")
+
+        if not (os.path.exists(model_path) and os.path.exists(scaler_path)
+                and os.path.exists(pca_path) and os.path.exists(encoder_path)):
+            logging.info("Modelo no encontrado para zona %s → entrenando por primera vez...", zone_id)
             need_retrain = True
-        else:
-            # 4. Si ya existe, verificar si hay datos nuevos en DB
-            metadata_path = os.path.join(zone_dir, "metadata.json")
-            db_ts = obtener_max_fecha_lectura(zone_id)
+        # ✅ Si ya existe modelo, NUNCA reentrenar automáticamente desde /predict
 
-            if os.path.exists(metadata_path):
-                with open(metadata_path, "r") as f:
-                    meta = json.load(f)
-                last_trained_at = meta.get("last_trained_at")
-                try:
-                    trained_dt = datetime.fromisoformat(last_trained_at)
-                    if db_ts is not None:
-                        db_dt = db_ts if not isinstance(db_ts, str) else datetime.fromisoformat(str(db_ts))
-                        if db_dt > trained_dt:
-                            need_retrain = True
-                except Exception:
-                    need_retrain = True
-            else:
-                need_retrain = True
-
-        # 5. Entrenar si corresponde
         if need_retrain:
-            logging.info("Entrenando/reentrenando zona %s ...", zone_id)
+            logging.info("Entrenando zona %s por primera vez...", zone_id)
             trainer.train_zone(zone_id)
-
-        # 6. Predecir con el modelo existente
-        clase_pred, X_scaled, zone_dir = trainer.predict_from_values(zone_id, payload)
+        # 6. Predecir con el modelo existente (ahora con probabilidades y comparación)
+        clase_pred, X_scaled, zone_dir, probabilidades_qsvc, comparacion_clasica = \
+            trainer.predict_from_values(zone_id, payload)
+        
+        sensibilidad_todos = trainer.analizar_sensibilidad_todos_cultivos(zone_id, payload)
         interpretacion = trainer.interpretacion_agronomica(payload)
+
+
+        # Análisis de sensibilidad (qué mover para favorecer otro cultivo)
+        try:
+            sensibilidad = trainer.analizar_sensibilidad(zone_id, payload)
+        except Exception:
+            logging.exception("No se pudo calcular sensibilidad")
+            sensibilidad = None
+
+        interpretacion_simple = trainer.generar_interpretacion_simple(
+            clase_pred, probabilidades_qsvc, comparacion_clasica, sensibilidad
+        )
+
+
+        try:
+            evaluacion_lote = trainer.evaluar_lote_zona(zone_id)
+        except Exception:
+            logging.exception("No se pudo calcular evaluación por lote")
+            evaluacion_lote = None
 
         base = f"/outputs/zone_{zone_id}/"
         imgs = {
@@ -213,11 +249,26 @@ async def predict(raw_body: Dict[str, Any] = Body(...), zone_id: Optional[int] =
             "bloch": base + "bloch_superposicion.png"
         }
 
+        # Tabla comparativa del paper, si ya se generó en el entrenamiento
+        tabla_paper_path = os.path.join(zone_dir, "comparacion_modelos_paper.csv")
+        tabla_paper = None
+        if os.path.exists(tabla_paper_path):
+            import pandas as pd
+            tabla_paper = pd.read_csv(tabla_paper_path).to_dict(orient="records")
+
         return {
             "status": "ok",
             "zone_id": zone_id,
-            "clase": int(clase_pred),
+            "clase": str(clase_pred),
+            "confianza_qsvc": probabilidades_qsvc.get(str(clase_pred)),
+            "probabilidades_qsvc": probabilidades_qsvc,
+            "comparacion_clasica": comparacion_clasica,
+
+            "sensibilidad_todos_cultivos": sensibilidad_todos,   # <-- NUEVO
+            "sensibilidad": sensibilidad,
+            "tabla_comparativa_cv": tabla_paper,
             "interpretacion": interpretacion,
+            "interpretacion_simple": interpretacion_simple,
             "imagenes": imgs,
             "input_used": payload
         }
@@ -227,8 +278,37 @@ async def predict(raw_body: Dict[str, Any] = Body(...), zone_id: Optional[int] =
     except Exception as e:
         logging.exception("Error en /predict")
         raise HTTPException(status_code=500, detail=str(e))
+    
 
 
+
+
+@app.get("/evaluar_lote")
+def evaluar_lote(zone_id: int, n_muestras: Optional[int] = None):
+    try:
+        return trainer.evaluar_lote_zona(zone_id, n_muestras)
+    except Exception as e:
+        logging.exception("Error en /evaluar_lote")
+        raise HTTPException(status_code=400, detail=str(e))
+    
+
+
+
+
+
+@app.get("/sensibilidad")
+def sensibilidad(zone_id: int):
+    try:
+        latest = obtener_ultimas_lecturas_de_zona(zone_id)
+        if not latest:
+            raise HTTPException(status_code=400, detail="No hay lecturas para la zona.")
+        payload = {k: float(v["valor"]) for k, v in latest.items()}
+        return trainer.analizar_sensibilidad(zone_id, payload)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception("Error en /sensibilidad")
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/")
 def root():
@@ -237,5 +317,5 @@ def root():
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 9000))
     uvicorn.run("main:app", host="0.0.0.0", port=port)

@@ -1,0 +1,11 @@
+.venv/
+entrenamiento_env/
+__pycache__/
+*.pyc
+.env
+.localenv
+outputs/
+maincopy.txt
+train_qsvc_local2222222.py
+06_poblar_lecturas_sensor.py
+07_generar_lecturas_realistas.py
