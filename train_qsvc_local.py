@@ -95,17 +95,28 @@ def conectar_bd():
     return conn
 
 
+def obtener_engine():
+    from sqlalchemy import create_engine
+
+    user = os.getenv("DB_USER")
+    password = os.getenv("DB_PASSWORD")
+    host = os.getenv("DB_HOST")
+    port = os.getenv("DB_PORT", 3306)
+    database = os.getenv("DB_NAME")
+
+    url = f"mysql+mysqlconnector://{user}:{password}@{host}:{port}/{database}"
+    return create_engine(url)
+
+
 def obtener_catalogo_cultivos():
-    conn = conectar_bd()
+    engine = obtener_engine()
 
     query = """
     SELECT *
     FROM catalogo_cultivos
     """
 
-    df = pd.read_sql(query, conn)
-
-    conn.close()
+    df = pd.read_sql(query, engine)
 
     return df
 
@@ -160,7 +171,12 @@ def leer_datos(conn, zone_id=None, limit=TRAIN_SIZE * 10):
     Lee lecturas de la BD ART.
     zone_id = terrenos.id
     Retorna DataFrame con columnas: tipo_sensor, valor, fecha_lectura
+    NOTA: el parámetro 'conn' ya no se usa para el query (se mantiene por
+    compatibilidad con las llamadas existentes), se usa un engine de
+    SQLAlchemy internamente para evitar el warning de pandas.
     """
+    engine = obtener_engine()
+
     if zone_id is None:
         query = """
             SELECT
@@ -175,7 +191,7 @@ def leer_datos(conn, zone_id=None, limit=TRAIN_SIZE * 10):
             ORDER BY l.timestamp_utc ASC
             LIMIT %s
         """
-        df = pd.read_sql(query, conn, params=(limit,))
+        df = pd.read_sql(query, engine, params=(limit,))
     else:
         query = """
             SELECT
@@ -191,7 +207,7 @@ def leer_datos(conn, zone_id=None, limit=TRAIN_SIZE * 10):
             ORDER BY l.timestamp_utc ASC
             LIMIT %s
         """
-        df = pd.read_sql(query, conn, params=(zone_id, limit))
+        df = pd.read_sql(query, engine, params=(zone_id, limit))
 
     logging.info("Registros leídos (zone=%s): %d", str(zone_id), len(df))
     return df
